@@ -182,6 +182,15 @@ describe("semantic: getSemanticStatus", () => {
     expect(status.enableHint).toContain("semanticSearchEnabled");
   });
 
+  test("enable hint names the file the global loader actually reads (#75)", () => {
+    // The global loader reads ~/.cass-memory/config.json (YAML accepted too);
+    // the old hint pointed only at config.yaml, which was ignored globally.
+    const status = getSemanticStatus({ semanticSearchEnabled: false });
+    expect(status.enableHint).toContain("~/.cass-memory/config.json");
+    expect(status.enableHint).toContain("doctor --fix");
+    expect(status.enableHint).not.toMatch(/in ~\/\.cass-memory\/config\.yaml\b/);
+  });
+
   test("returns disabled status when embeddingModel is 'none'", () => {
     const status = getSemanticStatus({ semanticSearchEnabled: true, embeddingModel: "none" });
     expect(status.enabled).toBe(false);
@@ -226,7 +235,7 @@ describe("semantic: formatSemanticModeMessage", () => {
       enabled: false,
       available: false,
       reason: "Semantic search is disabled in config",
-      enableHint: "Set semanticSearchEnabled: true in ~/.cass-memory/config.yaml",
+      enableHint: "Set semanticSearchEnabled: true in ~/.cass-memory/config.json (or config.yaml)",
       model: "Xenova/all-MiniLM-L6-v2",
     };
     const message = formatSemanticModeMessage("keyword", status);

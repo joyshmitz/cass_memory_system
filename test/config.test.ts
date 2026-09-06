@@ -10,7 +10,9 @@ import {
   saveConfig,
   isBudgetBakedInConfig,
   bakeBudgetIntoConfig,
+  patchGlobalConfig,
 } from "../src/config.js";
+import { ensureGlobalStructure } from "../src/utils.js";
 import { ConfigSchema, Config } from "../src/types.js";
 import { getEmbeddingBackend, getSemanticStatus, setEmbeddingBackend } from "../src/semantic.js";
 import { withTempDir, withTempCassHome, createIsolatedEnvironment, cleanupEnvironment, TestEnv } from "./helpers/index.js";
@@ -1112,6 +1114,177 @@ describe("Config Defaults Snapshot", () => {
       } finally {
         setEmbeddingBackend("xenova");
       }
+    });
+  });
+});
+
+// =============================================================================
+// Global config format parity (#75): ~/.cass-memory/config.{json,yaml,yml}
+// =============================================================================
+describe("loadConfig() - Global config format parity (#75)", () => {
+  test("loads ~/.cass-memory/config.yaml when no config.json exists", async () => {
+    await withTempCassHome(async (env) => {
+      await writeFile(
+        join(env.cassMemoryDir, "config.yaml"),
+        `provider: openai
+model: gpt-4o
+semanticSearchEnabled: true
+`
+      );
+
+      const config = await loadConfig();
+
+      expect(config.provider).toBe("openai");
+      expect(config.model).toBe("gpt-4o");
+      expect(config.semanticSearchEnabled).toBe(true);
+    });
+  });
+
+  test("loads ~/.cass-memory/config.yml and normalizes snake_case keys", async () => {
+    await withTempCassHome(async (env) => {
+      await writeFile(
+        join(env.cassMemoryDir, "config.yml"),
+        `semantic_search_enabled: true
+scoring:
+  decay_half_life_days: 30
+`
+      );
+
+      const config = await loadConfig();
+
+      expect(config.semanticSearchEnabled).toBe(true);
+      expect(config.scoring.decayHalfLifeDays).toBe(30);
+    });
+  });
+
+  test("config.json takes precedence over config.yaml and the shadowed file is reported", async () => {
+    await withTempCassHome(async (env) => {
+      await writeFile(env.configPath, JSON.stringify({ provider: "google" }));
+      await writeFile(join(env.cassMemoryDir, "config.yaml"), "provider: openai\nverbose: true\n");
+
+      const warnings: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => {
+        warnings.push(args.map(String).join(" "));
+      };
+      try {
+        const config = await loadConfig();
+        expect(config.provider).toBe("google");
+        // Nothing from the shadowed YAML leaks through.
+        expect(config.verbose).toBe(false);
+        expect(warnings.some((w) => w.includes("config.yaml") && w.includes("takes precedence"))).toBe(true);
+      } finally {
+        console.error = originalError;
+      }
+    });
+  });
+
+  test("saveConfig writes back to the active config.yaml (no config.json shadow is created)", async () => {
+    await withTempCassHome(async (env) => {
+      const yamlPath = join(env.cassMemoryDir, "config.yaml");
+      await writeFile(yamlPath, "# keep this comment\nprovider: openai\n");
+
+      const config = await loadConfig();
+      config.verbose = true;
+      await saveConfig(config);
+
+      const { readFile } = await import("node:fs/promises");
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(env.configPath)).toBe(false);
+      const text = await readFile(yamlPath, "utf-8");
+      expect(text).toContain("# keep this comment");
+
+      const reloaded = await loadConfig();
+      expect(reloaded.provider).toBe("openai");
+      expect(reloaded.verbose).toBe(true);
+    });
+  });
+
+  test("patchGlobalConfig merges a key into config.yaml, preserving comments and dropping the snake_case spelling", async () => {
+    await withTempCassHome(async (env) => {
+      const yamlPath = join(env.cassMemoryDir, "config.yaml");
+      await writeFile(
+        yamlPath,
+        `# global cm config
+provider: openai # my provider
+scoring:
+  # nested comment must survive an unrelated patch
+  decay_half_life_days: 45
+semantic_search_enabled: false
+`
+      );
+
+      expect(await patchGlobalConfig({ semanticSearchEnabled: true })).toBe(true);
+
+      const { readFile } = await import("node:fs/promises");
+      const text = await readFile(yamlPath, "utf-8");
+      expect(text).toContain("# global cm config");
+      expect(text).toContain("# my provider");
+      expect(text).toContain("# nested comment must survive an unrelated patch");
+      expect(text).toContain("decay_half_life_days: 45");
+      expect(text).toContain("semanticSearchEnabled: true");
+      expect(text).not.toContain("semantic_search_enabled");
+
+      const config = await loadConfig();
+      expect(config.semanticSearchEnabled).toBe(true);
+      expect(config.provider).toBe("openai");
+      expect(config.scoring.decayHalfLifeDays).toBe(45);
+    });
+  });
+
+  test("patchGlobalConfig creates config.json when no global config exists", async () => {
+    await withTempCassHome(async (env) => {
+      expect(await patchGlobalConfig({ semanticSearchEnabled: true })).toBe(true);
+
+      const { readFile } = await import("node:fs/promises");
+      const saved = JSON.parse(await readFile(env.configPath, "utf-8"));
+      expect(saved).toEqual({ semanticSearchEnabled: true });
+      expect((await loadConfig()).semanticSearchEnabled).toBe(true);
+    });
+  });
+
+  test("patchGlobalConfig refuses to clobber an unparseable config file", async () => {
+    await withTempCassHome(async (env) => {
+      const yamlPath = join(env.cassMemoryDir, "config.yaml");
+      await writeFile(yamlPath, "provider: [unterminated\n");
+
+      expect(await patchGlobalConfig({ semanticSearchEnabled: true })).toBe(false);
+
+      const { readFile } = await import("node:fs/promises");
+      expect(await readFile(yamlPath, "utf-8")).toBe("provider: [unterminated\n");
+    });
+  });
+
+  test("budget baking works against config.yaml", async () => {
+    await withTempCassHome(async (env) => {
+      const yamlPath = join(env.cassMemoryDir, "config.yaml");
+      await writeFile(yamlPath, "provider: openai\nbudget:\n  currency: EUR\n  note: keep\n");
+
+      expect(await isBudgetBakedInConfig()).toBe(false);
+      const budget = getDefaultConfig().budget;
+      expect(await bakeBudgetIntoConfig(budget)).toBe(true);
+      expect(await isBudgetBakedInConfig()).toBe(true);
+
+      const { readFile } = await import("node:fs/promises");
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(env.configPath)).toBe(false);
+      const text = await readFile(yamlPath, "utf-8");
+      expect(text).toContain("note: keep");
+      expect(text).toContain(`dailyLimit: ${budget.dailyLimit}`);
+    });
+  });
+
+  test("ensureGlobalStructure does not shadow an existing config.yaml with a default config.json", async () => {
+    await withTempCassHome(async (env) => {
+      await writeFile(join(env.cassMemoryDir, "config.yaml"), "provider: openai\n");
+
+      const result = await ensureGlobalStructure(JSON.stringify(getDefaultConfig()));
+
+      const { existsSync } = await import("node:fs");
+      expect(existsSync(env.configPath)).toBe(false);
+      expect(result.existed).toContain("config.yaml");
+      expect(result.created).not.toContain("config.json");
+      expect((await loadConfig()).provider).toBe("openai");
     });
   });
 });

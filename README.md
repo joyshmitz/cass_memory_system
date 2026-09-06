@@ -1439,6 +1439,11 @@ function invertToAntiPattern(content: string): string {
 ## ⚙️ Configuration
 
 Config lives at `~/.cass-memory/config.json` (global) and `.cass/config.json` (repo).
+Both locations also accept `config.yaml` / `config.yml` (keys may be written in
+`snake_case`); if more than one exists in the same directory, `config.json` wins
+and `cm doctor` flags the ignored file. `cm init` creates `config.json`; commands
+that persist settings (`cm privacy …`, `cm doctor --fix`, budget baking) write
+back to whichever file is active, in its own format.
 
 **Precedence:** CLI flags > Repo config > Global config > Defaults
 
@@ -1552,7 +1557,7 @@ Remote cass is **opt-in** and queries other machines via SSH (using your existin
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `semanticSearchEnabled` | `false` | Enable embedding-based search |
+| `semanticSearchEnabled` | `false` | Enable embedding-based search. Off by default, so fresh installs run keyword-only search; `cm doctor` reports this as a warning and `cm doctor --fix` offers a one-shot enable that verifies the embedding backend (downloading the local model if needed) before writing the flag |
 | `semanticWeight` | `0.6` | Weight of semantic vs keyword (0-1) |
 | `embeddingModel` | `Xenova/all-MiniLM-L6-v2` | Transformer model |
 | `embeddingBackend` | `xenova` | Embedding backend: `xenova` (local WASM) or `ollama` |
@@ -1572,6 +1577,61 @@ $ cm context "optimize API latency" --json | jq '.data | {semanticMode, semantic
 
 In human output, a yellow warning banner is printed whenever semantic
 was requested but unavailable — no more silent fallback.
+
+##### Enabling semantic search
+
+Set it in the global config the loader actually reads (`~/.cass-memory/config.json`,
+or `config.yaml` if that is what you use), or let the doctor do it:
+
+```bash
+cm doctor            # "Semantic Search: Status" warns while search is keyword-only
+cm doctor --fix      # cautious fix: verifies the embedding backend, then sets semanticSearchEnabled: true
+```
+
+The fix is deliberately *cautious* (it needs confirmation, or `--force` when
+non-interactive) because it may download the ~23 MB MiniLM model on first use
+and it refuses to flip the flag when the backend does not actually work — so you
+never end up with "enabled" config and a silent keyword fallback.
+
+##### Sharing an embedding backend with other tools
+
+cass-memory embeds with `Xenova/all-MiniLM-L6-v2` (384-d, ONNX, via
+transformers.js). Other tools — e.g. [eidetic_engine_cli](https://github.com/Dicklesworthstone/eidetic_engine_cli)
+(`ee`), which uses the `potion-multilingual-128M` model2vec model (256-d,
+safetensors) — use a different model family, so their model files cannot be
+shared byte-for-byte with cass-memory today, and embeddings from one are not
+comparable with the other. What *can* be shared:
+
+- **One local Ollama daemon for every tool.** cass-memory's Ollama backend uses
+  the standard `/api/embed` endpoint, so any tool that can talk to Ollama can
+  share the same daemon and the same pulled model:
+
+  ```bash
+  ollama pull all-minilm          # 384-d, same family as the built-in model
+  ```
+
+  ```json
+  {
+    "semanticSearchEnabled": true,
+    "embeddingBackend": "ollama",
+    "embeddingModel": "all-minilm",
+    "ollamaBaseUrl": "http://localhost:11434"
+  }
+  ```
+
+  `OLLAMA_BASE_URL` overrides `ollamaBaseUrl`, which is handy when the daemon
+  runs on another host. The bullet embedding cache
+  (`~/.cass-memory/embeddings/bullets.json`) is keyed by `embeddingModel`, so
+  changing the model rebuilds it lazily.
+
+- **The local model cache location is fixed.** With the default `xenova`
+  backend the model is downloaded once into
+  `~/.cache/cass-memory/transformers/` (transformers.js's own layout, not the
+  Hugging Face hub layout). transformers.js v2 does **not** honour `HF_HOME`
+  or `TRANSFORMERS_CACHE`, and cass-memory pins the cache there because the
+  library default resolves inside the read-only virtual filesystem of the
+  standalone binary. Pre-seed or symlink that directory on air-gapped
+  machines; there is currently no config knob to relocate it.
 
 ##### Troubleshooting: "Semantic search unavailable" in the prebuilt binary
 
@@ -1736,7 +1796,7 @@ flowchart TB
 
 ```
 ~/.cass-memory/                  # Global (user-level)
-├── config.json                  # User configuration
+├── config.json                  # User configuration (config.yaml/.yml also accepted)
 ├── playbook.yaml                # Personal playbook
 ├── diary/                       # Session summaries
 │   ├── d-abc123.json
@@ -1751,7 +1811,7 @@ flowchart TB
 └── usage.jsonl                  # LLM cost tracking
 
 .cass/                           # Project-level (in repo)
-├── config.json                  # Project-specific overrides
+├── config.json                  # Project-specific overrides (config.yaml/.yml also accepted)
 ├── playbook.yaml                # Project-specific rules
 ├── blocked.yaml                 # Anti-patterns to block
 └── context-log.jsonl            # Local context usage

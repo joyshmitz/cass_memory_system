@@ -6,10 +6,10 @@ import {
   Playbook,
   PlaybookBullet,
 } from "./types.js";
-import { atomicWrite, expandPath, hashContent, resolveGlobalDir, warn } from "./utils.js";
+import { atomicWrite, expandPath, getCliName, hashContent, resolveGlobalDir, warn } from "./utils.js";
 import { withLock } from "./lock.js";
 import { getOutputStyle } from "./output.js";
-import { ensureOnnxWasmRuntime } from "./wasm-runtime.js";
+import { ensureOnnxWasmRuntime, getTransformersCacheDir } from "./wasm-runtime.js";
 
 export const DEFAULT_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
 export const EMBEDDING_CACHE_VERSION = "1.0";
@@ -363,8 +363,8 @@ async function loadEmbedder(
         } catch (cacheError: any) {
           throw new Error(
             `Embedding model not available offline. To enable offline use:\n` +
-            `  1. Run any 'cm' command with semantic search while online to download the model\n` +
-            `  2. The model will be cached in ~/.cache/huggingface/\n` +
+            `  1. Run any '${getCliName()}' command with semantic search while online to download the model\n` +
+            `  2. The model will be cached in ${getTransformersCacheDir() ?? "the transformers.js cache"}\n` +
             `Original error: ${error.message}`
           );
         }
@@ -929,7 +929,11 @@ export function getSemanticStatus(config: {
       enabled: false,
       available: false,
       reason: "Semantic search is disabled in config",
-      enableHint: "Set semanticSearchEnabled: true in ~/.cass-memory/config.yaml",
+      // Name the file the global loader actually reads (#75): config.json is
+      // what `cm init` creates; config.yaml/.yml are accepted too.
+      enableHint:
+        `Set semanticSearchEnabled: true in ~/.cass-memory/config.json (or config.yaml), ` +
+        `or run \`${getCliName()} doctor --fix\``,
       model,
     };
   }

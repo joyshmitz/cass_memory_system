@@ -2,7 +2,7 @@ import { installGuard, installGitHook } from "./guard.js";
 import { getDefaultConfig } from "../config.js";
 import { createEmptyPlaybook, loadPlaybook, savePlaybook } from "../playbook.js";
 import { withLock } from "../lock.js";
-import { expandPath, fileExists, warn, resolveRepoDir, resolveGlobalDir, ensureRepoStructure, ensureGlobalStructure, getCliName, printJsonResult, atomicWrite, reportError, now } from "../utils.js";
+import { expandPath, fileExists, warn, resolveRepoDir, resolveGlobalDir, resolveGlobalConfigFile, ensureRepoStructure, ensureGlobalStructure, getCliName, printJsonResult, atomicWrite, reportError, now } from "../utils.js";
 import { ErrorCode, Config, TraumaEntry } from "../types.js";
 import { scanForTraumas, saveTrauma } from "../trauma.js";
 import { cassAvailable } from "../cass.js";
@@ -100,11 +100,13 @@ export async function initCommand(options: InitOptions) {
   if (process.env.CASS_PATH) {
     config.cassPath = process.env.CASS_PATH;
   }
-  const configPath = path.join(resolveGlobalDir(), "config.json");
+  // The active global config may be config.json, config.yaml or config.yml.
+  const configFile = await resolveGlobalConfigFile();
+  const configPath = configFile.path;
   const playbookPath = path.join(resolveGlobalDir(), "playbook.yaml");
   const playbook = createEmptyPlaybook();
-  
-  const hasConfig = await fileExists(configPath);
+
+  const hasConfig = configFile.exists;
   const hasPlaybook = await fileExists(playbookPath);
   const fullyInitialized = hasConfig && hasPlaybook;
   const hasAnyState = hasConfig || hasPlaybook;
@@ -126,7 +128,7 @@ export async function initCommand(options: InitOptions) {
   if (needsForceConfirmation) {
     if (isInteractive) {
       const ok = await promptYesNo(
-        `This will back up and overwrite ~/.cass-memory/config.json and playbook.yaml. Continue? [y/N]: `
+        `This will back up and overwrite ~/.cass-memory/${path.basename(configPath)} and playbook.yaml. Continue? [y/N]: `
       );
       if (!ok) {
         console.log(chalk.yellow("Cancelled."));
@@ -193,8 +195,10 @@ export async function initCommand(options: InitOptions) {
   const result = await ensureGlobalStructure(defaultConfigStr, defaultPlaybookStr);
 
   if (needsForceConfirmation) {
-    await atomicWrite(configPath, defaultConfigStr);
-    overwritten.push("config.json");
+    // Reset the ACTIVE config file in its own format, so a YAML config is not
+    // left behind shadowed by a freshly written config.json.
+    await atomicWrite(configPath, configFile.format === "yaml" ? yaml.stringify(config) : defaultConfigStr);
+    overwritten.push(path.basename(configPath));
     await atomicWrite(playbookPath, defaultPlaybookStr);
     overwritten.push("playbook.yaml");
   }

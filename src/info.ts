@@ -8,6 +8,7 @@ import chalk from "chalk";
 import {
   getVersion,
   resolveGlobalDir,
+  resolveGlobalConfigFile,
   resolveRepoDir,
   fileExists,
   getCliName,
@@ -99,16 +100,16 @@ export async function gatherInfo(): Promise<InfoResult> {
   const repoDir = await resolveRepoDir();
 
   // Configuration paths
-  const globalConfigPath = path.join(globalDir, "config.json");
+  const globalConfigFile = await resolveGlobalConfigFile();
+  const globalConfigPath = globalConfigFile.path;
+  const globalConfigExists = globalConfigFile.exists;
   const globalPlaybookPath = path.join(globalDir, "playbook.yaml");
   const workspacePlaybookPath = repoDir ? path.join(repoDir, "playbook.yaml") : null;
 
   const [
-    globalConfigExists,
     globalPlaybookExists,
     workspacePlaybookExists,
   ] = await Promise.all([
-    fileExists(globalConfigPath),
     fileExists(globalPlaybookPath),
     workspacePlaybookPath ? fileExists(workspacePlaybookPath) : Promise.resolve(false),
   ]);

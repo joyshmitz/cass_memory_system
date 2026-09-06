@@ -1,16 +1,12 @@
-import fs from "node:fs/promises";
-import path from "node:path";
 import chalk from "chalk";
 import { icon } from "../output.js";
-import { getDefaultConfig, saveConfig } from "../config.js";
+import { getDefaultConfig, readGlobalConfigRaw, saveConfig } from "../config.js";
 import { withLock } from "../lock.js";
 import { cassAvailable, cassTimeline, type CassRunner } from "../cass.js";
 import { Config, ConfigSchema, ErrorCode } from "../types.js";
 import {
-  expandPath,
   ensureGlobalStructure,
-  resolveGlobalDir,
-  fileExists,
+  resolveGlobalConfigFile,
   now,
   getCliName,
   printJsonResult,
@@ -43,18 +39,21 @@ function migrateDeprecatedLlmConfig(raw: Partial<Config>): Partial<Config> {
 
 async function loadGlobalConfigEnsuringInit(): Promise<Config> {
   const defaultConfig = getDefaultConfig();
-  const configPath = path.join(resolveGlobalDir(), "config.json");
 
-  // Ensure base directories + config exist. (Idempotent; does not overwrite.)
+  // Ensure base directories + config exist. (Idempotent; does not overwrite,
+  // and does not shadow an existing config.yaml with a default config.json.)
   await ensureGlobalStructure(JSON.stringify(defaultConfig, null, 2));
 
-  if (!(await fileExists(configPath))) {
+  const { file, data } = await readGlobalConfigRaw();
+  if (!file.exists) {
     // Should not happen (ensureGlobalStructure should create it), but be defensive.
     return defaultConfig;
   }
+  if (data === null) {
+    throw new Error(`Invalid global config: ${file.path} could not be parsed`);
+  }
 
-  const rawText = await fs.readFile(configPath, "utf-8");
-  const raw = migrateDeprecatedLlmConfig(JSON.parse(rawText) as Partial<Config>);
+  const raw = migrateDeprecatedLlmConfig(data as Partial<Config>);
 
   const merged: unknown = {
     ...defaultConfig,
@@ -123,7 +122,7 @@ export async function privacyCommand(
   let config = await loadGlobalConfigEnsuringInit();
   const runner = deps.cassRunner;
   const cli = getCliName();
-  const globalConfigPath = path.join(resolveGlobalDir(), "config.json");
+  const globalConfigPath = (await resolveGlobalConfigFile()).path;
   const daysCheck = validatePositiveInt(flags.days, "days", { min: 1, allowUndefined: true });
   if (!daysCheck.ok) {
     reportError(daysCheck.message, {

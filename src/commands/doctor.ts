@@ -1,10 +1,12 @@
-import { loadConfig, DEFAULT_CONFIG } from "../config.js";
+import { loadConfig, DEFAULT_CONFIG, patchGlobalConfig } from "../config.js";
 import { cassAvailable, cassNeedsIndex, cassStats, cassSearch, safeCassSearch } from "../cass.js";
 import {
   error as logError,
   fileExists,
   resolveRepoDir,
   resolveGlobalDir,
+  resolveGlobalConfigFile,
+  type ResolvedConfigFile,
   expandPath,
   getCliName,
   getVersion,
@@ -25,7 +27,9 @@ import { loadPlaybook, savePlaybook, createEmptyPlaybook } from "../playbook.js"
 import { withLock } from "../lock.js";
 import { Config, Playbook, ErrorCode } from "../types.js";
 import { loadTraumas } from "../trauma.js";
+import { getSemanticStatus, warmupEmbeddings } from "../semantic.js";
 import chalk from "chalk";
+import yaml from "yaml";
 import path from "node:path";
 import fs from "node:fs/promises";
 import readline from "node:readline";
@@ -111,12 +115,20 @@ type FixPlan = {
   wouldSkip: Array<{ id: string; reason: string }>;
 };
 
-type JsonFileValidation = { valid: true } | { valid: false; error: string };
+type ConfigFileValidation = { valid: true } | { valid: false; error: string };
 
-async function validateJsonFile(filePath: string): Promise<JsonFileValidation> {
+/**
+ * Syntax-level validation of a config file in its own format (JSON or YAML).
+ * Schema validation happens separately via loadConfig().
+ */
+async function validateConfigFile(file: ResolvedConfigFile): Promise<ConfigFileValidation> {
   try {
-    const raw = await fs.readFile(filePath, "utf-8");
-    JSON.parse(raw);
+    const raw = await fs.readFile(file.path, "utf-8");
+    const parsed: unknown = file.format === "yaml" ? yaml.parse(raw) : JSON.parse(raw);
+    // An empty YAML file parses to null and is treated as "no overrides".
+    if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) {
+      return { valid: false, error: "top-level value must be an object" };
+    }
     return { valid: true };
   } catch (err: any) {
     return { valid: false, error: err?.message || String(err) };
@@ -294,6 +306,24 @@ function buildRecommendedActions(params: {
     });
   }
 
+  const semanticCheck = params.checks.find(
+    (c) => c.category === "Semantic Search" && c.item === "Status"
+  );
+  if (semanticCheck?.status === "warn") {
+    const configPath =
+      (semanticCheck.details as { configPath?: string } | undefined)?.configPath ??
+      "~/.cass-memory/config.json";
+    actions.push({
+      label: "Enable semantic search (optional, recommended)",
+      command: `${cli} doctor --fix`,
+      reason:
+        `Search is keyword-only until semanticSearchEnabled is true. The fix verifies the embedding backend ` +
+        `first (the local model is a one-time ~23 MB download) and only then writes ` +
+        `"semanticSearchEnabled": true to ${configPath}; you can also set it there by hand.`,
+      urgency: "low",
+    });
+  }
+
   const repoCheck = params.checks.find(
     (c) => c.category === "Repo .cass/ Structure" && c.item === "Structure"
   );
@@ -364,7 +394,10 @@ async function computeDoctorChecks(
   // 2) Global Storage
   const globalDir = resolveGlobalDir();
   const globalPlaybookExists = await fileExists(path.join(globalDir, "playbook.yaml"));
-  const globalConfigExists = await fileExists(path.join(globalDir, "config.json"));
+  // The global config may be config.json, config.yaml or config.yml (#75).
+  const globalConfigFile = await resolveGlobalConfigFile();
+  const globalConfigExists = globalConfigFile.exists;
+  const globalConfigName = path.basename(globalConfigFile.path);
   const globalDiaryExists = await fileExists(path.join(globalDir, "diary"));
 
   const missingGlobal: string[] = [];
@@ -380,7 +413,8 @@ async function computeDoctorChecks(
   });
 
   // 2.5) Global config validity
-  const globalConfigPath = path.join(globalDir, "config.json");
+  const globalConfigPath = globalConfigFile.path;
+  const globalConfigFormat = globalConfigFile.format.toUpperCase();
   if (globalConfigExists) {
     if (options.configLoadError) {
       const message =
@@ -389,19 +423,33 @@ async function computeDoctorChecks(
           : String(options.configLoadError);
       checks.push({
         category: "Configuration",
-        item: "config.json",
+        item: globalConfigName,
         status: "fail",
         message: `Config validation failed: ${message}`,
         details: { path: globalConfigPath },
       });
     } else {
-      const validation = await validateJsonFile(globalConfigPath);
+      const validation = await validateConfigFile(globalConfigFile);
       checks.push({
         category: "Configuration",
-        item: "config.json",
+        item: globalConfigName,
         status: validation.valid ? "pass" : "fail",
-        message: validation.valid ? "Global config.json is valid JSON" : `Global config.json is invalid JSON: ${validation.error}`,
+        message: validation.valid
+          ? `Global ${globalConfigName} is valid ${globalConfigFormat}`
+          : `Global ${globalConfigName} is invalid ${globalConfigFormat}: ${validation.error}`,
         details: validation.valid ? { path: globalConfigPath } : { path: globalConfigPath, error: validation.error },
+      });
+    }
+
+    // A second config file next to the active one is silently ignored by the
+    // loader (JSON wins) — the exact confusion behind #75, so surface it.
+    for (const ignored of globalConfigFile.shadowed) {
+      checks.push({
+        category: "Configuration",
+        item: path.basename(ignored),
+        status: "warn",
+        message: `Ignored: ${globalConfigName} in the same directory takes precedence. Merge it into ${globalConfigName} or remove it.`,
+        details: { path: ignored, activeConfig: globalConfigPath },
       });
     }
   }
@@ -471,6 +519,44 @@ async function computeDoctorChecks(
     message: llmMessage,
     details: { configuredProvider: config.provider, availableProviders },
   });
+
+  // 3.5) Semantic search posture (#75). Keyword-only search is the silent
+  // default, so say so explicitly and name the file that actually controls it.
+  {
+    const semantic = getSemanticStatus(config);
+    const semanticDetails = {
+      semanticSearchEnabled: config.semanticSearchEnabled,
+      embeddingBackend: config.embeddingBackend,
+      embeddingModel: config.embeddingModel,
+      configPath: globalConfigPath,
+    };
+    if (semantic.enabled) {
+      checks.push({
+        category: "Semantic Search",
+        item: "Status",
+        status: "pass",
+        message: `Enabled (${config.embeddingBackend} backend, model ${semantic.model})`,
+        details: semanticDetails,
+      });
+    } else if (config.embeddingModel.trim() === "none") {
+      // Explicitly opted out via embeddingModel: "none" — respected, not nagged.
+      checks.push({
+        category: "Semantic Search",
+        item: "Status",
+        status: "pass",
+        message: "Disabled explicitly (embeddingModel: none)",
+        details: semanticDetails,
+      });
+    } else {
+      checks.push({
+        category: "Semantic Search",
+        item: "Status",
+        status: "warn",
+        message: `Disabled — context/similar use keyword-only search. ${semantic.enableHint}`,
+        details: semanticDetails,
+      });
+    }
+  }
 
   // 4) Repo-level .cass/ structure (if in a git repo)
   const cassDir = await resolveRepoDir();
@@ -1123,7 +1209,8 @@ diary/
 /**
  * Create fix for invalid config - reset to defaults.
  */
-function createResetConfigFix(configPath: string): FixableIssue {
+function createResetConfigFix(configFile: ResolvedConfigFile): FixableIssue {
+  const configPath = configFile.path;
   return {
     id: "reset-config",
     description: `Reset config to defaults (backup will be created): ${configPath}`,
@@ -1137,9 +1224,48 @@ function createResetConfigFix(configPath: string): FixableIssue {
         const backupPath = `${configPath}.backup.${Date.now()}`;
         await fs.copyFile(expandPath(configPath), backupPath);
       }
-      // Save default config
+      // Save default config in the file's own format
       await fs.mkdir(path.dirname(expandPath(configPath)), { recursive: true });
-      await atomicWrite(expandPath(configPath), JSON.stringify(DEFAULT_CONFIG, null, 2));
+      const serialized =
+        configFile.format === "yaml"
+          ? yaml.stringify(DEFAULT_CONFIG)
+          : JSON.stringify(DEFAULT_CONFIG, null, 2);
+      await atomicWrite(expandPath(configPath), serialized);
+    },
+  };
+}
+
+/**
+ * Create fix for semantic search being disabled (#75).
+ *
+ * Cautious on purpose: it verifies the configured embedding backend end to
+ * end first (for the local backend this downloads the model on first use;
+ * for Ollama it needs a reachable daemon with the model pulled) and only
+ * flips `semanticSearchEnabled` when that check succeeds, so the fix can
+ * never leave a user with "enabled" config and a broken backend.
+ */
+function createEnableSemanticSearchFix(config: Config, configPath: string): FixableIssue {
+  const backendLabel =
+    config.embeddingBackend === "ollama"
+      ? `Ollama at ${config.ollamaBaseUrl}`
+      : `local model ${config.embeddingModel}`;
+  return {
+    id: "enable-semantic-search",
+    description: `Enable semantic search in ${configPath} (verifies ${backendLabel} first; downloads it if needed)`,
+    category: "config",
+    severity: "warn",
+    safety: "cautious",
+    fix: async () => {
+      const warmup = await warmupEmbeddings({ model: config.embeddingModel });
+      if (!warmup.success) {
+        throw new Error(
+          `Embedding backend check failed (${backendLabel}); config left unchanged: ${warmup.error ?? "unknown error"}`
+        );
+      }
+      const written = await patchGlobalConfig({ semanticSearchEnabled: true });
+      if (!written) {
+        throw new Error(`Could not update ${configPath}: file is not a valid config object`);
+      }
     },
   };
 }
@@ -1163,7 +1289,9 @@ function createMissingBlockedLogFix(blockedPath: string): FixableIssue {
 /**
  * Detect fixable issues from health checks.
  */
-export async function detectFixableIssues(options: { configLoadError?: unknown } = {}): Promise<FixableIssue[]> {
+export async function detectFixableIssues(
+  options: { configLoadError?: unknown; config?: Config } = {}
+): Promise<FixableIssue[]> {
   const issues: FixableIssue[] = [];
 
   // Check global directory
@@ -1174,13 +1302,28 @@ export async function detectFixableIssues(options: { configLoadError?: unknown }
   }
 
   // Check config validity (only if config file exists)
-  const globalConfigPath = path.join(globalDir, "config.json");
-  const globalConfigExists = await fileExists(globalConfigPath);
-  if (globalDirExists && globalConfigExists) {
-    const validation = await validateJsonFile(globalConfigPath);
+  const globalConfigFile = await resolveGlobalConfigFile();
+  let configIsValid = !options.configLoadError;
+  if (globalDirExists && globalConfigFile.exists) {
+    const validation = await validateConfigFile(globalConfigFile);
     if (options.configLoadError || !validation.valid) {
-      issues.push(createResetConfigFix(globalConfigPath));
+      configIsValid = false;
+      issues.push(createResetConfigFix(globalConfigFile));
     }
+  }
+
+  // Semantic search disabled (the default) — offer a verified one-shot enable
+  // (#75). Skipped until the global directory exists (initialize first), when
+  // the config is broken (reset first), or when the user explicitly opted out
+  // with embeddingModel: "none".
+  if (
+    globalDirExists &&
+    configIsValid &&
+    options.config &&
+    options.config.semanticSearchEnabled === false &&
+    options.config.embeddingModel.trim() !== "none"
+  ) {
+    issues.push(createEnableSemanticSearchFix(options.config, globalConfigFile.path));
   }
 
   // Check global playbook
@@ -1451,7 +1594,7 @@ export async function doctorCommand(options: {
 
     let fixableIssues: FixableIssue[] = [];
     if (wantsStructured || fix || dryRun) {
-      fixableIssues = await detectFixableIssues({ configLoadError });
+      fixableIssues = await detectFixableIssues({ configLoadError, config });
     }
     let fixableIssueSummaries = fixableIssues.map(summarizeFixableIssue);
     const fixPlan = buildFixPlan(fixableIssueSummaries, { fix, dryRun, interactive, force });
@@ -1478,7 +1621,7 @@ export async function doctorCommand(options: {
       checks = await computeDoctorChecks(config, { configLoadError });
       overallStatus = computeOverallStatus(checks);
       if (wantsStructured) {
-        fixableIssues = await detectFixableIssues({ configLoadError });
+        fixableIssues = await detectFixableIssues({ configLoadError, config });
         fixableIssueSummaries = fixableIssues.map(summarizeFixableIssue);
       }
     }

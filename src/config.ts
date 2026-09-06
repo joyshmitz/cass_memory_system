@@ -2,7 +2,18 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "yaml";
 import { Config, ConfigSchema, SanitizationConfig, BudgetConfig } from "./types.js";
-import { fileExists, warn, atomicWrite, expandPath, normalizeYamlKeys, resolveRepoDir, resolveGlobalDir } from "./utils.js";
+import {
+  fileExists,
+  warn,
+  atomicWrite,
+  expandPath,
+  normalizeYamlKeys,
+  resolveRepoDir,
+  resolveGlobalDir,
+  resolveConfigFileInDir,
+  resolveGlobalConfigFile,
+  type ResolvedConfigFile,
+} from "./utils.js";
 import { configureEmbeddingBackend } from "./semantic.js";
 
 // --- Defaults ---
@@ -128,52 +139,47 @@ async function loadConfigFile(filePath: string): Promise<Partial<Config>> {
 }
 
 /**
- * Load repo-level config with format parity.
- * Supports both .cass/config.json and .cass/config.yaml (.yml).
- * Precedence: JSON preferred if both exist (deterministic behavior).
+ * Paths we have already warned about being shadowed, so a long-lived process
+ * (`cm serve`) does not repeat the warning on every config load.
+ */
+const _shadowWarned = new Set<string>();
+
+/**
+ * Load the config file from a config directory with format parity.
+ *
+ * Used for BOTH the global directory (`~/.cass-memory/`) and repo-level
+ * `.cass/` directories (#75: previously only repo configs honored YAML, while
+ * the global loader silently ignored `~/.cass-memory/config.yaml`).
+ *
+ * Supports config.json, config.yaml and config.yml. Precedence: JSON preferred
+ * if more than one exists (deterministic behavior); the ignored file(s) are
+ * reported once via a warning so the shadowing is never silent.
  *
  * @returns Loaded config and which source was used (for diagnostics)
  */
-async function loadRepoConfig(repoCassDir: string): Promise<{
+async function loadConfigFromDir(dir: string): Promise<{
   config: Partial<Config>;
   source: string | null;
 }> {
-  const jsonPath = path.join(repoCassDir, "config.json");
-  const yamlPath = path.join(repoCassDir, "config.yaml");
-  const ymlPath = path.join(repoCassDir, "config.yml");
+  const file = await resolveConfigFileInDir(dir);
+  if (!file.exists) return { config: {}, source: null };
 
-  // Check which files exist
-  const [jsonExists, yamlExists, ymlExists] = await Promise.all([
-    fileExists(jsonPath),
-    fileExists(yamlPath),
-    fileExists(ymlPath),
-  ]);
-
-  // Prefer JSON if it exists (deterministic precedence)
-  if (jsonExists) {
-    const config = await loadConfigFile(jsonPath);
-    return { config, source: jsonPath };
+  for (const ignored of file.shadowed) {
+    if (_shadowWarned.has(ignored)) continue;
+    _shadowWarned.add(ignored);
+    warn(
+      `Ignoring ${ignored}: ${path.basename(file.path)} in the same directory takes precedence ` +
+      `(remove one of them to avoid confusion)`
+    );
   }
 
-  // Fall back to YAML
-  if (yamlExists) {
-    const config = await loadConfigFile(yamlPath);
-    return { config, source: yamlPath };
-  }
-
-  // Fall back to YML
-  if (ymlExists) {
-    const config = await loadConfigFile(ymlPath);
-    return { config, source: ymlPath };
-  }
-
-  return { config: {}, source: null };
+  const config = await loadConfigFile(file.path);
+  return { config, source: file.path };
 }
 
 export async function loadConfig(cliOverrides: Partial<Config> = {}): Promise<Config> {
   const defaults = getCachedDefaults();
-  const globalConfigPath = path.join(resolveGlobalDir(), "config.json");
-  const globalConfigRaw = await loadConfigFile(globalConfigPath);
+  const { config: globalConfigRaw } = await loadConfigFromDir(resolveGlobalDir());
 
   // Migrate deprecated llm.* shape to top-level
   const globalConfig = migrateLlmConfig(globalConfigRaw);
@@ -186,7 +192,7 @@ export async function loadConfig(cliOverrides: Partial<Config> = {}): Promise<Co
   const repoCassDir = await resolveRepoDir();
 
   if (repoCassDir) {
-    const { config: repoConfigRaw } = await loadRepoConfig(repoCassDir);
+    const { config: repoConfigRaw } = await loadConfigFromDir(repoCassDir);
 
     // Migrate deprecated llm.* shape to top-level
     repoConfig = migrateLlmConfig(repoConfigRaw);
@@ -370,8 +376,104 @@ export async function loadConfig(cliOverrides: Partial<Config> = {}): Promise<Co
   return result.data;
 }
 
+// --- Global config file I/O (format-aware) ---
+
+/**
+ * Raw (unvalidated) contents of the active global config file.
+ *
+ * `data` is `{}` when no file exists, and `null` when the file exists but
+ * could not be parsed or is not an object — writers must never clobber such
+ * a file. YAML keys are normalized to camelCase exactly like the loader does.
+ */
+export async function readGlobalConfigRaw(): Promise<{
+  file: ResolvedConfigFile;
+  data: Record<string, unknown> | null;
+}> {
+  const file = await resolveGlobalConfigFile();
+  if (!file.exists) return { file, data: {} };
+
+  try {
+    const content = await fs.readFile(file.path, "utf-8");
+    const parsed: unknown =
+      file.format === "yaml" ? normalizeYamlKeys(yaml.parse(content)) : JSON.parse(content);
+    // An empty YAML file parses to null; treat it as an empty object.
+    if (parsed === null || parsed === undefined) return { file, data: {} };
+    if (typeof parsed !== "object" || Array.isArray(parsed)) return { file, data: null };
+    return { file, data: parsed as Record<string, unknown> };
+  } catch {
+    return { file, data: null };
+  }
+}
+
+function camelToSnake(key: string): string {
+  return key.replace(/[A-Z]/g, (ch) => `_${ch.toLowerCase()}`);
+}
+
+/**
+ * Write the global config file in that file's format.
+ *
+ * JSON: `data` is written as the whole document (callers pass the merged
+ * object). YAML: only `changedKeys` are updated in the existing document, so
+ * comments and untouched sections survive; a `snake_case` spelling of an
+ * updated key is dropped so the file never carries two spellings of one
+ * setting.
+ */
+async function writeGlobalConfigKeys(
+  file: ResolvedConfigFile,
+  data: Record<string, unknown>,
+  changedKeys: string[] = Object.keys(data)
+): Promise<void> {
+  if (file.format === "json") {
+    await atomicWrite(file.path, JSON.stringify(data, null, 2));
+    return;
+  }
+
+  const existing = file.exists ? await fs.readFile(file.path, "utf-8") : "";
+  const doc = yaml.parseDocument(existing);
+  if (doc.errors.length > 0 || (doc.contents !== null && !yaml.isMap(doc.contents))) {
+    // readGlobalConfigRaw() already reports such files as unwritable (null);
+    // this is the last line of defense against clobbering them.
+    throw new Error(`Refusing to rewrite ${file.path}: not a valid YAML mapping`);
+  }
+  for (const key of changedKeys) {
+    const value = data[key];
+    const snake = camelToSnake(key);
+    if (snake !== key && doc.has(snake)) doc.delete(snake);
+    if (value === undefined) {
+      // JSON.stringify drops undefined; mirror that instead of writing `null`.
+      doc.delete(key);
+      continue;
+    }
+    doc.set(key, value);
+  }
+  await atomicWrite(file.path, doc.toString());
+}
+
+/**
+ * Merge top-level keys into the global config file, preserving every other
+ * key (and, for YAML, comments). Creates `config.json` when no global config
+ * file exists yet.
+ *
+ * `values` may be a function of the current (normalized) file contents, for
+ * patches that need to merge into a nested object.
+ *
+ * @returns true if the file was written, false if it was skipped because the
+ *          existing file is corrupt or not an object (never clobbered).
+ */
+export async function patchGlobalConfig(
+  values:
+    | Record<string, unknown>
+    | ((existing: Record<string, unknown>) => Record<string, unknown>)
+): Promise<boolean> {
+  const { file, data } = await readGlobalConfigRaw();
+  if (data === null) return false;
+  const patch = typeof values === "function" ? values(data) : values;
+  await writeGlobalConfigKeys(file, { ...data, ...patch }, Object.keys(patch));
+  return true;
+}
+
 export async function saveConfig(config: Config): Promise<void> {
-  const globalConfigPath = path.join(resolveGlobalDir(), "config.json");
+  const file = await resolveGlobalConfigFile();
 
   // Normalize dynamically resolved paths back to portable defaults before
   // persisting. loadConfig() expands "~/.cass-memory/playbook.yaml" to an
@@ -386,7 +488,7 @@ export async function saveConfig(config: Config): Promise<void> {
     toSave.diaryDir = "~/.cass-memory/diary";
   }
 
-  await atomicWrite(globalConfigPath, JSON.stringify(toSave, null, 2));
+  await writeGlobalConfigKeys(file, toSave as unknown as Record<string, unknown>);
 }
 
 // --- Budget baking (#68) ---
@@ -402,24 +504,18 @@ export async function saveConfig(config: Config): Promise<void> {
  * spend ceilings (dailyLimit and monthlyLimit) are present in the file.
  */
 export async function isBudgetBakedInConfig(): Promise<boolean> {
-  const globalConfigPath = path.join(resolveGlobalDir(), "config.json");
-  if (!(await fileExists(globalConfigPath))) return false;
-
-  try {
-    const raw = JSON.parse(await fs.readFile(globalConfigPath, "utf-8"));
-    const budget = raw?.budget;
-    return (
-      !!budget &&
-      typeof budget === "object" &&
-      !Array.isArray(budget) &&
-      budget.dailyLimit !== undefined &&
-      budget.monthlyLimit !== undefined
-    );
-  } catch {
-    // Unreadable/corrupt config: report unbaked so the default-budget notice
-    // shows; bakeBudgetIntoConfig separately refuses to clobber such a file.
-    return false;
-  }
+  // Unreadable/corrupt config reads as null: report unbaked so the
+  // default-budget notice shows; bakeBudgetIntoConfig separately refuses to
+  // clobber such a file.
+  const { data } = await readGlobalConfigRaw();
+  const budget = data?.budget;
+  return (
+    !!budget &&
+    typeof budget === "object" &&
+    !Array.isArray(budget) &&
+    (budget as Record<string, unknown>).dailyLimit !== undefined &&
+    (budget as Record<string, unknown>).monthlyLimit !== undefined
+  );
 }
 
 /**
@@ -434,38 +530,22 @@ export async function isBudgetBakedInConfig(): Promise<boolean> {
  * (#68) is only to pin the spend ceilings in effect at first reflect.
  *
  * @returns true if the file was written, false if baking was skipped
- *          (existing file is corrupt or not a JSON object).
+ *          (existing file is corrupt or not an object).
  */
 export async function bakeBudgetIntoConfig(budget: BudgetConfig): Promise<boolean> {
-  const globalConfigPath = path.join(resolveGlobalDir(), "config.json");
-
-  let raw: Record<string, unknown> = {};
-  if (await fileExists(globalConfigPath)) {
-    try {
-      const parsed = JSON.parse(await fs.readFile(globalConfigPath, "utf-8"));
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return false;
-      }
-      raw = parsed as Record<string, unknown>;
-    } catch {
-      // Never overwrite a config file we could not parse.
-      return false;
-    }
-  }
-
-  const existingBudget =
-    raw.budget && typeof raw.budget === "object" && !Array.isArray(raw.budget)
-      ? (raw.budget as Record<string, unknown>)
-      : {};
-
-  raw.budget = {
-    ...existingBudget,
-    dailyLimit: budget.dailyLimit,
-    monthlyLimit: budget.monthlyLimit,
-    warningThreshold: budget.warningThreshold,
-    currency: budget.currency,
-  };
-
-  await atomicWrite(globalConfigPath, JSON.stringify(raw, null, 2));
-  return true;
+  return patchGlobalConfig((existing) => {
+    const existingBudget =
+      existing.budget && typeof existing.budget === "object" && !Array.isArray(existing.budget)
+        ? (existing.budget as Record<string, unknown>)
+        : {};
+    return {
+      budget: {
+        ...existingBudget,
+        dailyLimit: budget.dailyLimit,
+        monthlyLimit: budget.monthlyLimit,
+        warningThreshold: budget.warningThreshold,
+        currency: budget.currency,
+      },
+    };
+  });
 }

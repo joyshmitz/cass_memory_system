@@ -799,3 +799,272 @@ describe("doctorCommand", () => {
     });
   });
 });
+
+// =============================================================================
+// Semantic search posture + global config format parity (#75)
+// =============================================================================
+describe("doctorCommand - semantic search posture (#75)", () => {
+  const noKeys = { ANTHROPIC_API_KEY: undefined, OPENAI_API_KEY: undefined, GOOGLE_GENERATIVE_AI_API_KEY: undefined };
+
+  async function runDoctorJson(opts: Parameters<typeof doctorCommand>[0] = { json: true }) {
+    process.exitCode = 0;
+    const { output } = await captureConsoleLog(() => doctorCommand({ json: true, ...opts }));
+    const envelope = JSON.parse(output);
+    expect(envelope.success).toBe(true);
+    return envelope.data;
+  }
+
+  test("reports keyword-only search as a warning with a verified one-shot enable fix", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          await writeFile(env.configPath, JSON.stringify({ provider: "anthropic" }));
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson();
+
+          const semantic = payload.checks.find(
+            (c: any) => c.category === "Semantic Search" && c.item === "Status"
+          );
+          expect(semantic).toBeDefined();
+          expect(semantic.status).toBe("warn");
+          expect(semantic.message).toContain("keyword-only");
+          expect(semantic.message).toContain("config.json");
+          expect(semantic.details.configPath).toBe(env.configPath);
+
+          const fix = payload.fixableIssues.find((f: any) => f.id === "enable-semantic-search");
+          expect(fix).toBeDefined();
+          expect(fix.safety).toBe("cautious");
+          expect(fix.description).toContain(env.configPath);
+
+          const action = payload.recommendedActions.find((a: any) => a.label.includes("Enable semantic search"));
+          expect(action).toBeDefined();
+          expect(action.reason).toContain(env.configPath);
+        });
+      });
+    });
+  });
+
+  test("passes when semantic search is enabled and offers no fix", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          await writeFile(env.configPath, JSON.stringify({ semanticSearchEnabled: true }));
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson();
+          const semantic = payload.checks.find((c: any) => c.category === "Semantic Search");
+          expect(semantic.status).toBe("pass");
+          expect(semantic.message).toContain("xenova");
+          expect(payload.fixableIssues.some((f: any) => f.id === "enable-semantic-search")).toBe(false);
+        });
+      });
+    });
+  });
+
+  test("respects an explicit embeddingModel: none opt-out (pass, no nag, no fix)", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          await writeFile(env.configPath, JSON.stringify({ semanticSearchEnabled: false, embeddingModel: "none" }));
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson();
+          const semantic = payload.checks.find((c: any) => c.category === "Semantic Search");
+          expect(semantic.status).toBe("pass");
+          expect(payload.fixableIssues.some((f: any) => f.id === "enable-semantic-search")).toBe(false);
+          expect(payload.recommendedActions.some((a: any) => a.label.includes("Enable semantic search"))).toBe(false);
+        });
+      });
+    });
+  });
+
+  test("does not offer the enable fix while the global config is invalid", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          await writeFile(env.configPath, "{{{{invalid json");
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson();
+          expect(payload.fixableIssues.some((f: any) => f.id === "reset-config")).toBe(true);
+          expect(payload.fixableIssues.some((f: any) => f.id === "enable-semantic-search")).toBe(false);
+        });
+      });
+    });
+  });
+
+  test("honors ~/.cass-memory/config.yaml and reports it as the active config", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          const yamlPath = path.join(env.cassMemoryDir, "config.yaml");
+          await writeFile(yamlPath, "semantic_search_enabled: true\n");
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson();
+
+          const structure = payload.checks.find(
+            (c: any) => c.category === "Global Storage (~/.cass-memory)" && c.item === "Structure"
+          );
+          expect(structure.status).toBe("pass");
+
+          const configCheck = payload.checks.find(
+            (c: any) => c.category === "Configuration" && c.item === "config.yaml"
+          );
+          expect(configCheck).toBeDefined();
+          expect(configCheck.status).toBe("pass");
+          expect(configCheck.message).toContain("valid YAML");
+          expect(configCheck.details.path).toBe(yamlPath);
+
+          const semantic = payload.checks.find((c: any) => c.category === "Semantic Search");
+          expect(semantic.status).toBe("pass");
+        });
+      });
+    });
+  });
+
+  test("flags a config.yaml that is shadowed by config.json", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          const yamlPath = path.join(env.cassMemoryDir, "config.yaml");
+          await writeFile(env.configPath, JSON.stringify({ semanticSearchEnabled: true }));
+          await writeFile(yamlPath, "semantic_search_enabled: false\n");
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson();
+
+          const shadowed = payload.checks.find(
+            (c: any) => c.category === "Configuration" && c.item === "config.yaml"
+          );
+          expect(shadowed).toBeDefined();
+          expect(shadowed.status).toBe("warn");
+          expect(shadowed.message).toContain("Ignored");
+          expect(shadowed.details.activeConfig).toBe(env.configPath);
+        });
+      });
+    });
+  });
+
+  test("invalid YAML global config is reported and reset in place (as YAML)", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          const yamlPath = path.join(env.cassMemoryDir, "config.yaml");
+          await writeFile(yamlPath, "provider: [unterminated\n");
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const before = await runDoctorJson();
+          const configCheck = before.checks.find(
+            (c: any) => c.category === "Configuration" && c.item === "config.yaml"
+          );
+          expect(configCheck.status).toBe("fail");
+          expect(configCheck.message).toContain("invalid YAML");
+
+          const after = await runDoctorJson({ json: true, fix: true, force: true, interactive: false });
+          const reset = after.fixResults.find((r: any) => r.id === "reset-config");
+          expect(reset.success).toBe(true);
+
+          const { readFile } = await import("node:fs/promises");
+          const { existsSync } = await import("node:fs");
+          const text = await readFile(yamlPath, "utf-8");
+          expect(yaml.parse(text).provider).toBe("anthropic");
+          // Reset stays in the file's own format; no shadowing config.json appears.
+          expect(existsSync(env.configPath)).toBe(false);
+        });
+      });
+    });
+  });
+
+  test("enable fix leaves config unchanged when the embedding backend is unreachable", async () => {
+    await withEnvAsync(noKeys, async () => {
+      await withTempCassHome(async (env) => {
+        await withCwd(env.home, async () => {
+          const original = {
+            semanticSearchEnabled: false,
+            embeddingBackend: "ollama",
+            ollamaBaseUrl: "http://127.0.0.1:1",
+          };
+          await writeFile(env.configPath, JSON.stringify(original));
+          await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+          const payload = await runDoctorJson({ json: true, fix: true, force: true, interactive: false });
+
+          const result = payload.fixResults.find((r: any) => r.id === "enable-semantic-search");
+          expect(result).toBeDefined();
+          expect(result.success).toBe(false);
+          expect(result.message).toContain("config left unchanged");
+
+          const { readFile } = await import("node:fs/promises");
+          expect(JSON.parse(await readFile(env.configPath, "utf-8"))).toEqual(original);
+          const semantic = payload.checks.find((c: any) => c.category === "Semantic Search");
+          expect(semantic.status).toBe("warn");
+        });
+      });
+    });
+  });
+
+  test("enable fix verifies the backend end to end, then flips semanticSearchEnabled in place", async () => {
+    // A real HTTP server standing in for an Ollama daemon: the fix must
+    // actually round-trip an embedding before it touches the config.
+    let embedCalls = 0;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: async (req) => {
+        const url = new URL(req.url);
+        if (req.method === "POST" && url.pathname === "/api/embed") {
+          embedCalls++;
+          const body = (await req.json()) as { model: string; input: string };
+          expect(body.model).toBe("all-minilm");
+          expect(typeof body.input).toBe("string");
+          return Response.json({ embeddings: [[0.1, 0.2, 0.3]] });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+
+    try {
+      await withEnvAsync(noKeys, async () => {
+        await withTempCassHome(async (env) => {
+          await withCwd(env.home, async () => {
+            await writeFile(
+              env.configPath,
+              JSON.stringify({
+                provider: "anthropic",
+                embeddingBackend: "ollama",
+                ollamaBaseUrl: `http://127.0.0.1:${server.port}`,
+                customUnknownKey: "keep-me",
+              }, null, 2)
+            );
+            await writeFile(env.playbookPath, createValidPlaybookYaml());
+
+            const payload = await runDoctorJson({ json: true, fix: true, force: true, interactive: false });
+
+            const result = payload.fixResults.find((r: any) => r.id === "enable-semantic-search");
+            expect(result).toBeDefined();
+            expect(result.success).toBe(true);
+            expect(embedCalls).toBeGreaterThan(0);
+
+            const { readFile } = await import("node:fs/promises");
+            const saved = JSON.parse(await readFile(env.configPath, "utf-8"));
+            expect(saved.semanticSearchEnabled).toBe(true);
+            // Only the one key was added; everything else is preserved.
+            expect(saved.provider).toBe("anthropic");
+            expect(saved.customUnknownKey).toBe("keep-me");
+            expect(saved.embeddingBackend).toBe("ollama");
+
+            // Post-fix re-evaluation reflects the new posture.
+            const semantic = payload.checks.find((c: any) => c.category === "Semantic Search");
+            expect(semantic.status).toBe("pass");
+            expect(semantic.message).toContain("ollama");
+            expect(payload.fixableIssues.some((f: any) => f.id === "enable-semantic-search")).toBe(false);
+          });
+        });
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+});

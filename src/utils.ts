@@ -1084,6 +1084,62 @@ export function resolveGlobalDir(): string {
   return expandPath("~/.cass-memory");
 }
 
+// --- Config file discovery (global + repo) ---
+
+/**
+ * Config file names honored in a config directory (global `~/.cass-memory/`
+ * and repo-level `.cass/`), in precedence order: JSON wins when more than
+ * one exists, so behavior is deterministic (#75).
+ */
+export const CONFIG_FILENAMES = ["config.json", "config.yaml", "config.yml"] as const;
+
+export type ConfigFileFormat = "json" | "yaml";
+
+export interface ResolvedConfigFile {
+  /** Absolute path of the active config file (may not exist yet). */
+  path: string;
+  /** Serialization format implied by the file extension. */
+  format: ConfigFileFormat;
+  /** Whether the active file currently exists on disk. */
+  exists: boolean;
+  /**
+   * Other config files present in the same directory that are ignored
+   * because a higher-precedence file exists (e.g. `config.yaml` when
+   * `config.json` is also present). Used for diagnostics.
+   */
+  shadowed: string[];
+}
+
+export function configFileFormat(filePath: string): ConfigFileFormat {
+  const ext = path.extname(filePath).toLowerCase();
+  return ext === ".yaml" || ext === ".yml" ? "yaml" : "json";
+}
+
+/**
+ * Resolve which config file is active in `dir`.
+ *
+ * Both the global directory and repo `.cass/` directories accept
+ * `config.json`, `config.yaml`, or `config.yml`. When none exists the
+ * result points at `config.json` (the file writers create) with
+ * `exists: false`.
+ */
+export async function resolveConfigFileInDir(dir: string): Promise<ResolvedConfigFile> {
+  const candidates = CONFIG_FILENAMES.map((name) => path.join(dir, name));
+  const present = await Promise.all(candidates.map((p) => fileExists(p)));
+  const activeIndex = present.findIndex(Boolean);
+  if (activeIndex === -1) {
+    return { path: candidates[0], format: "json", exists: false, shadowed: [] };
+  }
+  const active = candidates[activeIndex];
+  const shadowed = candidates.filter((p, i) => i !== activeIndex && present[i]);
+  return { path: active, format: configFileFormat(active), exists: true, shadowed };
+}
+
+/** Resolve the active global config file (`~/.cass-memory/config.{json,yaml,yml}`). */
+export async function resolveGlobalConfigFile(): Promise<ResolvedConfigFile> {
+  return resolveConfigFileInDir(resolveGlobalDir());
+}
+
 export async function ensureGlobalStructure(
   defaultConfigStr?: string, 
   defaultPlaybookStr?: string
@@ -1100,12 +1156,13 @@ export async function ensureGlobalStructure(
       await ensureDir(path.join(globalDir, d));
   }
 
-  // config.json
-  const configPath = path.join(globalDir, "config.json");
-  if (await fileExists(configPath)) {
-      existed.push("config.json");
+  // config.json (or an existing config.yaml/.yml, which must not be shadowed
+  // by a freshly written default config.json — JSON takes precedence)
+  const configFile = await resolveConfigFileInDir(globalDir);
+  if (configFile.exists) {
+      existed.push(path.basename(configFile.path));
   } else if (defaultConfigStr) {
-      await atomicWrite(configPath, defaultConfigStr);
+      await atomicWrite(configFile.path, defaultConfigStr);
       created.push("config.json");
   }
 

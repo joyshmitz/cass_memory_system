@@ -54,8 +54,25 @@ import ortWasmPath from "../node_modules/onnxruntime-web/dist/ort-wasm.wasm" wit
 import ortWasmSimdPath from "../node_modules/onnxruntime-web/dist/ort-wasm-simd.wasm" with { type: "file" };
 import ortWasmThreadedPath from "../node_modules/onnxruntime-web/dist/ort-wasm-threaded.wasm" with { type: "file" };
 import ortWasmSimdThreadedPath from "../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm" with { type: "file" };
+import path from "node:path";
 
 let configured = false;
+
+/**
+ * Directory where `@xenova/transformers` caches downloaded model files for
+ * cass-memory (`~/.cache/cass-memory/transformers/`).
+ *
+ * transformers.js v2 does NOT read `HF_HOME` / `TRANSFORMERS_CACHE`; its
+ * default is `<package dir>/.cache/`, which inside a Bun standalone binary is
+ * the read-only `/$bunfs` virtual filesystem — so we always redirect it here.
+ * Returns null when no home directory can be determined (library default
+ * applies).
+ */
+export function getTransformersCacheDir(): string | null {
+  const home = process.env.HOME || process.env.USERPROFILE;
+  if (!home) return null;
+  return path.join(home, ".cache", "cass-memory", "transformers");
+}
 
 /**
  * Ensure `onnxruntime-web`'s WASM runtime files resolve to real,
@@ -84,14 +101,10 @@ export async function ensureOnnxWasmRuntime(): Promise<void> {
   try {
     const transformers: any = await import("@xenova/transformers");
     const tEnv = transformers?.env ?? transformers?.default?.env;
-    if (tEnv) {
-      const home = process.env.HOME || process.env.USERPROFILE;
-      if (home) {
-        const path = await import("node:path");
-        const cacheDir = path.join(home, ".cache", "cass-memory", "transformers");
-        tEnv.cacheDir = cacheDir;
-        tEnv.localModelPath = cacheDir;
-      }
+    const cacheDir = getTransformersCacheDir();
+    if (tEnv && cacheDir) {
+      tEnv.cacheDir = cacheDir;
+      tEnv.localModelPath = cacheDir;
     }
   } catch {
     // non-fatal — cache redirection is a polish, not a correctness fix
